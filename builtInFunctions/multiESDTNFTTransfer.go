@@ -14,6 +14,7 @@ import (
 
 type esdtNFTMultiTransfer struct {
 	baseActiveHandler
+	vmcommon.BlockchainDataProvider
 	*baseComponentsHolder
 	keyPrefix      []byte
 	payableHandler vmcommon.PayableChecker
@@ -23,6 +24,7 @@ type esdtNFTMultiTransfer struct {
 	mutExecution   sync.RWMutex
 	rolesHandler   vmcommon.ESDTRoleHandler
 	baseTokenID    []byte
+	drwaReader     drwaStateReader
 }
 
 const argumentsPerTransfer = uint64(3)
@@ -62,13 +64,14 @@ func NewESDTNFTMultiTransferFunc(
 	}
 
 	e := &esdtNFTMultiTransfer{
-		keyPrefix:      []byte(baseESDTKeyPrefix),
-		funcGasCost:    funcGasCost,
-		accounts:       accounts,
-		gasConfig:      gasConfig,
-		mutExecution:   sync.RWMutex{},
-		payableHandler: &disabledPayableHandler{},
-		rolesHandler:   roleHandler,
+		BlockchainDataProvider: NewBlockchainDataProvider(),
+		keyPrefix:              []byte(baseESDTKeyPrefix),
+		funcGasCost:            funcGasCost,
+		accounts:               accounts,
+		gasConfig:              gasConfig,
+		mutExecution:           sync.RWMutex{},
+		payableHandler:         &disabledPayableHandler{},
+		rolesHandler:           roleHandler,
 		baseComponentsHolder: &baseComponentsHolder{
 			esdtStorageHandler:    esdtStorageHandler,
 			globalSettingsHandler: globalSettingsHandler,
@@ -84,6 +87,10 @@ func NewESDTNFTMultiTransferFunc(
 	}
 
 	return e, nil
+}
+
+func (e *esdtNFTMultiTransfer) SetDRWAReader(reader drwaStateReader) {
+	e.drwaReader = reader
 }
 
 // SetPayableChecker will set the payableCheck handler to the function
@@ -161,6 +168,13 @@ func (e *esdtNFTMultiTransfer) ProcessBuiltinFunction(
 	err = e.payableHandler.CheckPayable(vmInput, vmInput.RecipientAddr, int(minNumOfArguments))
 	if err != nil {
 		return nil, err
+	}
+	for i := uint64(0); i < numOfTransfers; i++ {
+		tokenStartIndex := startIndex + i*argumentsPerTransfer
+		err = checkDRWAReceiverTransfer(e.drwaReader, vmInput.Arguments[tokenStartIndex], vmInput.RecipientAddr, acntDst, e.CurrentRound())
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	topicTokenData := make([]*TopicTokenData, 0)
@@ -287,20 +301,44 @@ func (e *esdtNFTMultiTransfer) processESDTNFTMultiTransferOnSenderShard(
 
 	skipGasUse := noGasUseIfReturnCallAfterErrorWithFlag(e.enableEpochsHandler, vmInput)
 	multiTransferCost := numOfTransfers * e.funcGasCost
-	if vmInput.GasProvided < multiTransferCost && !skipGasUse {
-		return nil, ErrNotEnoughGas
-	}
-
 	acntDst, err := e.loadAccountIfInShard(dstAddress)
 	if err != nil {
 		return nil, err
 	}
-
 	if !check.IfNil(acntDst) {
 		err = e.payableHandler.CheckPayable(vmInput, dstAddress, int(minNumOfArguments))
 		if err != nil {
 			return nil, err
 		}
+	}
+	startIndex := uint64(2)
+	for i := uint64(0); i < numOfTransfers; i++ {
+		tokenStartIndex := startIndex + i*argumentsPerTransfer
+		tokenID := vmInput.Arguments[tokenStartIndex]
+
+		if isDRWAEnforcementEnabled(e.enableEpochsHandler) {
+			regulated, drwaErr := evaluateDRWASenderTransfer(e.drwaReader, tokenID, vmInput.CallerAddr, acntSnd, e.CurrentRound())
+			if regulated {
+				multiTransferCost += computeDRWAReadGasCost(e.gasConfig, e.funcGasCost, 2)
+			}
+			err = drwaErr
+			if err != nil {
+				return nil, err
+			}
+			if !check.IfNil(acntDst) {
+				regulated, drwaErr = evaluateDRWAReceiverTransfer(e.drwaReader, tokenID, dstAddress, acntDst, e.CurrentRound())
+				if regulated {
+					multiTransferCost += computeDRWAReadGasCost(e.gasConfig, e.funcGasCost, 2)
+				}
+				err = drwaErr
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
+	}
+	if vmInput.GasProvided < multiTransferCost && !skipGasUse {
+		return nil, ErrNotEnoughGas
 	}
 
 	vmOutput := &vmcommon.VMOutput{
@@ -309,7 +347,6 @@ func (e *esdtNFTMultiTransfer) processESDTNFTMultiTransferOnSenderShard(
 		Logs:         make([]*vmcommon.LogEntry, 0, numOfTransfers),
 	}
 
-	startIndex := uint64(2)
 	listEsdtData := make([]*esdt.ESDigitalToken, numOfTransfers)
 	listTransferData := make([]*vmcommon.ESDTTransfer, numOfTransfers)
 

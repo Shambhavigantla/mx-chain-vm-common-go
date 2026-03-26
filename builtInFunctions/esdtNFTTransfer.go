@@ -20,6 +20,7 @@ var zeroByteArray = []byte{0}
 
 type esdtNFTTransfer struct {
 	baseAlwaysActiveHandler
+	vmcommon.BlockchainDataProvider
 	*baseComponentsHolder
 	keyPrefix      []byte
 	payableHandler vmcommon.PayableChecker
@@ -28,6 +29,7 @@ type esdtNFTTransfer struct {
 	gasConfig      vmcommon.BaseOperationCost
 	mutExecution   sync.RWMutex
 	rolesHandler   vmcommon.ESDTRoleHandler
+	drwaReader     drwaStateReader
 }
 
 // NewESDTNFTTransferFunc returns the esdt NFT transfer built-in function component
@@ -65,13 +67,14 @@ func NewESDTNFTTransferFunc(
 	}
 
 	e := &esdtNFTTransfer{
-		keyPrefix:      []byte(baseESDTKeyPrefix),
-		funcGasCost:    funcGasCost,
-		accounts:       accounts,
-		gasConfig:      gasConfig,
-		mutExecution:   sync.RWMutex{},
-		payableHandler: &disabledPayableHandler{},
-		rolesHandler:   rolesHandler,
+		BlockchainDataProvider: NewBlockchainDataProvider(),
+		keyPrefix:              []byte(baseESDTKeyPrefix),
+		funcGasCost:            funcGasCost,
+		accounts:               accounts,
+		gasConfig:              gasConfig,
+		mutExecution:           sync.RWMutex{},
+		payableHandler:         &disabledPayableHandler{},
+		rolesHandler:           rolesHandler,
 		baseComponentsHolder: &baseComponentsHolder{
 			esdtStorageHandler:    esdtStorageHandler,
 			globalSettingsHandler: globalSettingsHandler,
@@ -82,6 +85,10 @@ func NewESDTNFTTransferFunc(
 	}
 
 	return e, nil
+}
+
+func (e *esdtNFTTransfer) SetDRWAReader(reader drwaStateReader) {
+	e.drwaReader = reader
 }
 
 // SetPayableChecker will set the payableCheck handler to the function
@@ -138,6 +145,16 @@ func (e *esdtNFTTransfer) ProcessBuiltinFunction(
 	}
 	if check.IfNil(acntDst) {
 		return nil, ErrInvalidRcvAddr
+	}
+	if isDRWAEnforcementEnabled(e.enableEpochsHandler) {
+		regulated, drwaErr := evaluateDRWAReceiverTransfer(e.drwaReader, vmInput.Arguments[0], vmInput.RecipientAddr, acntDst, e.CurrentRound())
+		if regulated && vmInput.GasProvided < computeDRWAReadGasCost(e.gasConfig, e.funcGasCost, 2) {
+			return nil, ErrNotEnoughGas
+		}
+		err = drwaErr
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	tickerID := vmInput.Arguments[0]
@@ -223,7 +240,18 @@ func (e *esdtNFTTransfer) processNFTTransferOnSenderShard(
 		return nil, ErrInvalidRcvAddr
 	}
 	skipGasUse := noGasUseIfReturnCallAfterErrorWithFlag(e.enableEpochsHandler, vmInput)
-	if vmInput.GasProvided < e.funcGasCost && !skipGasUse {
+	gasToUse := e.funcGasCost
+	if isDRWAEnforcementEnabled(e.enableEpochsHandler) {
+		regulated, drwaErr := evaluateDRWASenderTransfer(e.drwaReader, vmInput.Arguments[0], vmInput.CallerAddr, acntSnd, e.CurrentRound())
+		if regulated {
+			gasToUse += computeDRWAReadGasCost(e.gasConfig, e.funcGasCost, 2)
+		}
+		err := drwaErr
+		if err != nil {
+			return nil, err
+		}
+	}
+	if vmInput.GasProvided < gasToUse && !skipGasUse {
 		return nil, ErrNotEnoughGas
 	}
 
@@ -276,6 +304,16 @@ func (e *esdtNFTTransfer) processNFTTransferOnSenderShard(
 		if !ok {
 			return nil, ErrWrongTypeAssertion
 		}
+		if isDRWAEnforcementEnabled(e.enableEpochsHandler) {
+			regulated, drwaErr := evaluateDRWAReceiverTransfer(e.drwaReader, vmInput.Arguments[0], dstAddress, userAccount, e.CurrentRound())
+			if regulated {
+				gasToUse += computeDRWAReadGasCost(e.gasConfig, e.funcGasCost, 2)
+			}
+			err = drwaErr
+			if err != nil {
+				return nil, err
+			}
+		}
 
 		err = e.payableHandler.CheckPayable(vmInput, dstAddress, core.MinLenArgumentsESDTNFTTransfer)
 		if err != nil {
@@ -322,7 +360,7 @@ func (e *esdtNFTTransfer) processNFTTransferOnSenderShard(
 
 	vmOutput := &vmcommon.VMOutput{
 		ReturnCode:   vmcommon.Ok,
-		GasRemaining: computeGasRemainingIfNeeded(acntSnd, vmInput.GasProvided, e.funcGasCost, skipGasUse),
+		GasRemaining: computeGasRemainingIfNeeded(acntSnd, vmInput.GasProvided, gasToUse, skipGasUse),
 	}
 	err = e.createNFTOutputTransfers(vmInput, vmOutput, esdtData, dstAddress, tickerID, nonce, skipGasUse)
 	if err != nil {
